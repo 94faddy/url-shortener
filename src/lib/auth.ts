@@ -2,7 +2,7 @@ import { NextAuthOptions } from "next-auth"
 import GoogleProvider from "next-auth/providers/google"
 import CredentialsProvider from "next-auth/providers/credentials"
 import { PrismaAdapter } from "@next-auth/prisma-adapter"
-import { prisma } from "./db"
+import { prisma, executeWithRetry } from "./db"
 import bcrypt from "bcryptjs"
 
 // สร้าง custom adapter สำหรับ hybrid approach
@@ -13,7 +13,6 @@ const createHybridAdapter = () => {
     ...baseAdapter,
     // Override สำหรับ credentials - ไม่สร้าง session ใน database
     createSession: async (session: any) => {
-      // ถ้าเป็น credentials provider ให้ใช้ JWT แทน
       console.log('🔧 Custom adapter: createSession called')
       return baseAdapter.createSession!(session)
     }
@@ -52,11 +51,12 @@ export const authOptions: NextAuthOptions = {
         }
 
         try {
-          const user = await prisma.user.findUnique({
-            where: {
-              email: credentials.email
-            }
-          })
+          const user = await executeWithRetry(
+            () => prisma.user.findUnique({
+              where: { email: credentials.email }
+            }),
+            { operationName: 'Find user for auth' }
+          )
 
           if (!user || !user.password) {
             return null
@@ -93,9 +93,8 @@ export const authOptions: NextAuthOptions = {
   },
   
   jwt: {
-    secret: process.env.NEXTAUTH_SECRET, // กำหนด secret อย่างชัดเจน
+    secret: process.env.NEXTAUTH_SECRET,
     maxAge: parseInt(process.env.SESSION_MAX_AGE || "7200"),
-    // เพิ่ม encoding options เพื่อหลีกเลี่ยง JWE error
     encode: async ({ secret, token, maxAge }) => {
       const { encode } = await import("next-auth/jwt")
       return encode({ secret, token, maxAge })
@@ -106,7 +105,6 @@ export const authOptions: NextAuthOptions = {
         return await decode({ secret, token })
       } catch (error) {
         console.error("❌ JWT decode error:", error)
-        // Return null แทน throw error เพื่อให้ NextAuth สร้าง session ใหม่
         return null
       }
     }
@@ -121,32 +119,40 @@ export const authOptions: NextAuthOptions = {
         // สำหรับ Google OAuth - ใช้ database session
         if (account?.provider === "google" && profile) {
           try {
-            const existingUser = await prisma.user.findUnique({
-              where: { email: user.email! }
-            })
+            const existingUser = await executeWithRetry(
+              () => prisma.user.findUnique({
+                where: { email: user.email! }
+              }),
+              { operationName: 'Find existing user for Google OAuth' }
+            )
 
             if (existingUser) {
-              await prisma.user.update({
-                where: { email: user.email! },
-                data: {
-                  name: user.name,
-                  image: user.image,
-                  emailVerified: now,
-                  updatedAt: now,
-                }
-              })
+              await executeWithRetry(
+                () => prisma.user.update({
+                  where: { email: user.email! },
+                  data: {
+                    name: user.name,
+                    image: user.image,
+                    emailVerified: now,
+                    updatedAt: now,
+                  }
+                }),
+                { operationName: 'Update user for Google OAuth' }
+              )
               user.id = existingUser.id
             }
             
             // ลบ sessions เก่าที่หมดอายุ
             if (user.id) {
-              await prisma.session.deleteMany({
-                where: {
-                  userId: user.id,
-                  expires: { lte: now }
-                }
-              })
-              
+              await executeWithRetry(
+                () => prisma.session.deleteMany({
+                  where: {
+                    userId: user.id,
+                    expires: { lte: now }
+                  }
+                }),
+                { operationName: 'Delete expired sessions' }
+              ).catch(err => console.warn('Warning deleting expired sessions:', err))
             }
           } catch (dbError) {
             console.error("❌ Database error in Google OAuth:", dbError)
@@ -174,41 +180,21 @@ export const authOptions: NextAuthOptions = {
         if (user && !token) {
           session.user.id = user.id
           
-          // ดึงข้อมูลล่าสุดจาก database
-          const dbUser = await prisma.user.findUnique({
-            where: { id: user.id },
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              image: true,
-              emailVerified: true,
-            }
-          })
-          
-          if (dbUser) {
-            session.user.name = dbUser.name
-            session.user.email = dbUser.email
-            session.user.image = dbUser.image
-          }
-        } 
-        // สำหรับ JWT sessions (Credentials provider)
-        else if (token?.sub) {
-          session.user.id = token.sub
-          console.log(`🎫 Using JWT session for user: ${token.sub}`)
-          
-          // ดึงข้อมูลจาก database เพื่อ sync ข้อมูลล่าสุด
+          // ดึงข้อมูลล่าสุดจาก database พร้อม retry
           try {
-            const dbUser = await prisma.user.findUnique({
-              where: { id: token.sub },
-              select: {
-                id: true,
-                name: true,
-                email: true,
-                image: true,
-                emailVerified: true,
-              }
-            })
+            const dbUser = await executeWithRetry(
+              () => prisma.user.findUnique({
+                where: { id: user.id },
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  image: true,
+                  emailVerified: true,
+                }
+              }),
+              { operationName: 'Fetch user for session (OAuth)', maxRetries: 2, delay: 500 }
+            )
             
             if (dbUser) {
               session.user.name = dbUser.name
@@ -216,7 +202,36 @@ export const authOptions: NextAuthOptions = {
               session.user.image = dbUser.image
             }
           } catch (dbError) {
-            console.error("❌ Error fetching user data for JWT session:", dbError)
+            console.warn("⚠️ Could not fetch fresh user data for OAuth session:", dbError)
+            // ใช้ข้อมูลที่มีอยู่แทน
+          }
+        } 
+        // สำหรับ JWT sessions (Credentials provider)
+        else if (token?.sub) {
+          session.user.id = token.sub
+          
+          // ดึงข้อมูลจาก database พร้อม retry - แต่ไม่ให้ error หยุดการทำงาน
+          try {
+            const dbUser = await executeWithRetry(
+              () => prisma.user.findUnique({
+                where: { id: token.sub },
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  image: true,
+                }
+              }),
+              { operationName: 'Fetch user for session (JWT)', maxRetries: 2, delay: 500 }
+            )
+            
+            if (dbUser) {
+              session.user.name = dbUser.name
+              session.user.email = dbUser.email
+              session.user.image = dbUser.image
+            }
+          } catch (dbError) {
+            console.warn("⚠️ Could not fetch fresh user data for JWT session, using token data:", dbError)
             // ใช้ข้อมูลจาก token แทน
             session.user.name = token.name as string
             session.user.email = token.email as string
@@ -256,15 +271,18 @@ export const authOptions: NextAuthOptions = {
       // สำหรับ update trigger
       if (trigger === "update" && token.sub) {
         try {
-          const dbUser = await prisma.user.findUnique({
-            where: { id: token.sub },
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              image: true,
-            }
-          })
+          const dbUser = await executeWithRetry(
+            () => prisma.user.findUnique({
+              where: { id: token.sub },
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                image: true,
+              }
+            }),
+            { operationName: 'Fetch user for JWT update', maxRetries: 2, delay: 500 }
+          )
           
           if (dbUser) {
             token.name = dbUser.name
@@ -272,7 +290,7 @@ export const authOptions: NextAuthOptions = {
             token.picture = dbUser.image
           }
         } catch (error) {
-          console.error("❌ Error updating JWT token:", error)
+          console.warn("⚠️ Error updating JWT token:", error)
         }
       }
       
@@ -320,7 +338,6 @@ export const authOptions: NextAuthOptions = {
         sameSite: "lax",
         path: "/",
         secure: process.env.NODE_ENV === "production",
-        domain: process.env.NODE_ENV === "production" ? ".ngrok-free.app" : undefined,
       },
     },
     callbackUrl: {
@@ -344,6 +361,5 @@ export const authOptions: NextAuthOptions = {
   
   debug: process.env.NODE_ENV === "development" || process.env.NEXTAUTH_DEBUG === "true",
   
-  // กำหนด secret อย่างชัดเจนเพื่อหลีกเลี่ยง JWT errors
   secret: process.env.NEXTAUTH_SECRET,
 }

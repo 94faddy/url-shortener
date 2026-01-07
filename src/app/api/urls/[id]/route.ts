@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth/next'
 import { authOptions } from '@/lib/auth'
-import { prisma } from '@/lib/db'
+import { prisma, executeWithRetry } from '@/lib/db'
 
 // GET - ดึงข้อมูล URL แต่ละตัวพร้อมสถิติที่แม่นยำ
 export async function GET(
@@ -17,189 +17,142 @@ export async function GET(
 
     const { id } = await params
 
-    const url = await prisma.url.findFirst({
-      where: {
-        id: id,
-        userId: session.user.id
-      },
-      include: {
-        _count: {
-          select: { clicks: true }
+    const url = await executeWithRetry(
+      () => prisma.url.findFirst({
+        where: {
+          id: id,
+          userId: session.user.id
+        },
+        include: {
+          _count: {
+            select: { clicks: true }
+          }
         }
-      }
-    })
+      }),
+      { operationName: 'Fetch URL details' }
+    )
 
     if (!url) {
       return NextResponse.json({ error: 'URL not found' }, { status: 404 })
     }
 
     // ดึงสถิติเพิ่มเติมจาก Click table
-    const totalClicks = await prisma.click.count({
-      where: { urlId: url.id }
-    })
-
-    // คลิกวันนี้
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-    const tomorrow = new Date(today)
-    tomorrow.setDate(tomorrow.getDate() + 1)
-
-    const todayClicks = await prisma.click.count({
-      where: {
-        urlId: url.id,
-        clickedAt: {
-          gte: today,
-          lt: tomorrow
-        }
-      }
-    })
-
-    // คลิกย้อนหลัง 7 วัน
-    const sevenDaysAgo = new Date()
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-    sevenDaysAgo.setHours(0, 0, 0, 0)
-
-    const weekClicks = await prisma.click.count({
-      where: {
-        urlId: url.id,
-        clickedAt: {
-          gte: sevenDaysAgo
-        }
-      }
-    })
-
-    // Unique visitors (30 วันที่ผ่านมา)
-    const thirtyDaysAgo = new Date()
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
-    thirtyDaysAgo.setHours(0, 0, 0, 0)
-
-    const uniqueVisitors = await prisma.click.findMany({
-      where: {
-        urlId: url.id,
-        clickedAt: {
-          gte: thirtyDaysAgo
-        }
-      },
-      select: {
-        ipAddress: true
-      },
-      distinct: ['ipAddress']
-    })
-
-    // คลิกล่าสุด 10 รายการ
-    const recentClicks = await prisma.click.findMany({
-      where: { urlId: url.id },
-      orderBy: { clickedAt: 'desc' },
-      take: 10,
-      select: {
-        id: true,
-        clickedAt: true,
-        country: true,
-        countryName: true,
-        city: true,
-        referer: true,
-        userAgent: true,
-        ipAddress: true
-      }
-    })
-
-    // สถิติประเทศ (30 วันที่ผ่านมา)
-    const countryStats = await prisma.click.groupBy({
-      by: ['country'],
-      where: {
-        urlId: url.id,
-        clickedAt: {
-          gte: thirtyDaysAgo
-        },
-        country: {
-          not: null
-        }
-      },
-      _count: {
-        id: true
-      },
-      orderBy: {
-        _count: {
-          id: 'desc'
-        }
-      },
-      take: 10
-    })
-
-    // สถิติ referrers (30 วันที่ผ่านมา)
-    const referrerClicks = await prisma.click.findMany({
-      where: {
-        urlId: url.id,
-        clickedAt: {
-          gte: thirtyDaysAgo
-        }
-      },
-      select: {
-        referer: true
-      }
-    })
-
-    const referrerStats = new Map<string, number>()
-    referrerClicks.forEach(click => {
-      let referrer = 'direct'
-      if (click.referer) {
-        try {
-          referrer = new URL(click.referer).hostname.replace('www.', '')
-        } catch {
-          referrer = 'direct'
-        }
-      }
-      referrerStats.set(referrer, (referrerStats.get(referrer) || 0) + 1)
-    })
-
-    const topReferrers = Array.from(referrerStats.entries())
-      .map(([referer, clicks]) => ({ referer, clicks }))
-      .sort((a, b) => b.clicks - a.clicks)
-      .slice(0, 10)
-
-    // รายการวัน (7 วันที่ผ่านมา)
-    const dailyStats = []
-    for (let i = 6; i >= 0; i--) {
-      const date = new Date()
-      date.setDate(date.getDate() - i)
-      date.setHours(0, 0, 0, 0)
+    const [totalClicks, todayClicks, weekClicks, uniqueVisitors, recentClicks, countryStats] = await Promise.all([
+      executeWithRetry(
+        () => prisma.click.count({ where: { urlId: url.id } }),
+        { operationName: 'Count total clicks' }
+      ),
       
-      const nextDay = new Date(date)
-      nextDay.setDate(nextDay.getDate() + 1)
-
-      const dayClicks = await prisma.click.count({
-        where: {
-          urlId: url.id,
-          clickedAt: {
-            gte: date,
-            lt: nextDay
+      // คลิกวันนี้
+      executeWithRetry(
+        () => {
+          const today = new Date()
+          today.setHours(0, 0, 0, 0)
+          const tomorrow = new Date(today)
+          tomorrow.setDate(tomorrow.getDate() + 1)
+          
+          return prisma.click.count({
+            where: {
+              urlId: url.id,
+              clickedAt: { gte: today, lt: tomorrow }
+            }
+          })
+        },
+        { operationName: 'Count today clicks' }
+      ),
+      
+      // คลิกย้อนหลัง 7 วัน
+      executeWithRetry(
+        () => {
+          const sevenDaysAgo = new Date()
+          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+          sevenDaysAgo.setHours(0, 0, 0, 0)
+          
+          return prisma.click.count({
+            where: {
+              urlId: url.id,
+              clickedAt: { gte: sevenDaysAgo }
+            }
+          })
+        },
+        { operationName: 'Count week clicks' }
+      ),
+      
+      // Unique visitors (30 วันที่ผ่านมา)
+      executeWithRetry(
+        () => {
+          const thirtyDaysAgo = new Date()
+          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+          thirtyDaysAgo.setHours(0, 0, 0, 0)
+          
+          return prisma.click.findMany({
+            where: {
+              urlId: url.id,
+              clickedAt: { gte: thirtyDaysAgo }
+            },
+            select: { ipAddress: true },
+            distinct: ['ipAddress']
+          })
+        },
+        { operationName: 'Fetch unique visitors' }
+      ),
+      
+      // คลิกล่าสุด 10 รายการ
+      executeWithRetry(
+        () => prisma.click.findMany({
+          where: { urlId: url.id },
+          orderBy: { clickedAt: 'desc' },
+          take: 10,
+          select: {
+            id: true,
+            clickedAt: true,
+            country: true,
+            countryName: true,
+            city: true,
+            referer: true,
+            userAgent: true,
+            ipAddress: true
           }
-        }
-      })
-
-      dailyStats.push({
-        date: date.toISOString().split('T')[0],
-        clicks: dayClicks
-      })
-    }
+        }),
+        { operationName: 'Fetch recent clicks' }
+      ),
+      
+      // สถิติประเทศ (30 วันที่ผ่านมา)
+      executeWithRetry(
+        () => {
+          const thirtyDaysAgo = new Date()
+          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+          thirtyDaysAgo.setHours(0, 0, 0, 0)
+          
+          return prisma.click.groupBy({
+            by: ['country'],
+            where: {
+              urlId: url.id,
+              clickedAt: { gte: thirtyDaysAgo },
+              country: { not: null }
+            },
+            _count: { id: true },
+            orderBy: { _count: { id: 'desc' } },
+            take: 10
+          })
+        },
+        { operationName: 'Fetch country stats' }
+      )
+    ])
 
     return NextResponse.json({
       ...url,
-      _count: {
-        clicks: totalClicks // ใช้จำนวนจริงจาก Click table
-      },
+      _count: { clicks: totalClicks },
       stats: {
         totalClicks,
         todayClicks,
         weekClicks,
         uniqueVisitors: uniqueVisitors.length,
-        dailyStats,
         topCountries: countryStats.map(stat => ({
           country: stat.country,
           countryName: getCountryName(stat.country || ''),
           clicks: stat._count.id
         })),
-        topReferrers,
         recentClicks,
         dataSource: 'click_table_realtime'
       }
@@ -213,7 +166,7 @@ export async function GET(
   }
 }
 
-// PUT - อัพเดท URL (ส่วนที่เพิ่ม originalUrl)
+// PUT - อัพเดท URL
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -227,14 +180,17 @@ export async function PUT(
 
     const { id } = await params
     const body = await request.json()
-    const { originalUrl, title, description, isActive, expiresAt } = body // เพิ่ม originalUrl
+    const { originalUrl, title, description, isActive, expiresAt } = body
 
-    const existingUrl = await prisma.url.findFirst({
-      where: {
-        id: id,
-        userId: session.user.id
-      }
-    })
+    const existingUrl = await executeWithRetry(
+      () => prisma.url.findFirst({
+        where: {
+          id: id,
+          userId: session.user.id
+        }
+      }),
+      { operationName: 'Find existing URL for update' }
+    )
 
     if (!existingUrl) {
       return NextResponse.json({ error: 'URL not found' }, { status: 404 })
@@ -267,42 +223,27 @@ export async function PUT(
       }
     }
 
-    const updatedUrl = await prisma.url.update({
-      where: {
-        id: id
-      },
-      data: {
-        originalUrl: originalUrl?.trim() || existingUrl.originalUrl, // เพิ่มการอัพเดท originalUrl
-        title: title?.trim() || null,
-        description: description?.trim() || null,
-        isActive: typeof isActive === 'boolean' ? isActive : existingUrl.isActive,
-        expiresAt: expiryDate,
-        updatedAt: new Date()
-      },
-      include: {
-        _count: {
-          select: { clicks: true }
+    const updatedUrl = await executeWithRetry(
+      () => prisma.url.update({
+        where: { id: id },
+        data: {
+          originalUrl: originalUrl?.trim() || existingUrl.originalUrl,
+          title: title?.trim() || null,
+          description: description?.trim() || null,
+          isActive: typeof isActive === 'boolean' ? isActive : existingUrl.isActive,
+          expiresAt: expiryDate,
+          updatedAt: new Date()
+        },
+        include: {
+          _count: { select: { clicks: true } }
         }
-      }
-    })
-
-    // ดึงสถิติล่าสุด
-    const totalClicks = await prisma.click.count({
-      where: { urlId: updatedUrl.id }
-    })
+      }),
+      { operationName: 'Update URL' }
+    )
 
     console.log(`✅ Updated URL: ${updatedUrl.shortCode}`)
 
-    return NextResponse.json({
-      ...updatedUrl,
-      _count: {
-        clicks: totalClicks
-      },
-      stats: {
-        totalClicks,
-        dataSource: 'click_table_realtime'
-      }
-    })
+    return NextResponse.json(updatedUrl)
   } catch (error) {
     console.error('Error updating URL:', error)
     return NextResponse.json({ 
@@ -328,12 +269,15 @@ export async function DELETE(
 
     console.log('Attempting to delete URL:', id, 'for user:', session.user.id)
 
-    const existingUrl = await prisma.url.findFirst({
-      where: {
-        id: id,
-        userId: session.user.id
-      }
-    })
+    const existingUrl = await executeWithRetry(
+      () => prisma.url.findFirst({
+        where: {
+          id: id,
+          userId: session.user.id
+        }
+      }),
+      { operationName: 'Find URL for deletion' }
+    )
 
     if (!existingUrl) {
       console.log('URL not found:', id)
@@ -341,29 +285,33 @@ export async function DELETE(
     }
 
     // นับจำนวน clicks ก่อนลบ
-    const clickCount = await prisma.click.count({
-      where: { urlId: id }
-    })
+    const clickCount = await executeWithRetry(
+      () => prisma.click.count({ where: { urlId: id } }),
+      { operationName: 'Count clicks before deletion' }
+    )
 
     console.log(`URL ${id} has ${clickCount} clicks that will be deleted`)
 
-    // ใช้ transaction เพื่อความปลอดภัย
-    await prisma.$transaction(async (tx) => {
-      // ลบ clicks ที่เกี่ยวข้องก่อน
-      await tx.click.deleteMany({
-        where: { urlId: id }
-      })
+    // ใช้ transaction พร้อม retry เพื่อความปลอดภัย
+    await executeWithRetry(
+      () => prisma.$transaction(async (tx) => {
+        // ลบ clicks ที่เกี่ยวข้องก่อน
+        await tx.click.deleteMany({
+          where: { urlId: id }
+        })
 
-      // ลบ analytics ที่เกี่ยวข้องก่อน
-      await tx.analytics.deleteMany({
-        where: { urlId: id }
-      })
+        // ลบ analytics ที่เกี่ยวข้อง
+        await tx.analytics.deleteMany({
+          where: { urlId: id }
+        })
 
-      // ลบ URL
-      await tx.url.delete({
-        where: { id: id }
-      })
-    })
+        // ลบ URL
+        await tx.url.delete({
+          where: { id: id }
+        })
+      }),
+      { operationName: 'Delete URL transaction', maxRetries: 3, delay: 1000 }
+    )
 
     console.log(`✅ URL deleted successfully: ${id} (removed ${clickCount} clicks)`)
     
@@ -411,13 +359,7 @@ function getCountryName(countryCode: string): string {
     'RU': 'รัสเซีย',
     'KH': 'กัมพูชา',
     'LA': 'ลาว',
-    'MM': 'พม่า',
-    'BD': 'บังกลาเทศ',
-    'PK': 'ปากีสถาน',
-    'LK': 'ศรีลังกา',
-    'NP': 'เนปาล',
-    'BT': 'ภูฏาน',
-    'MV': 'มัลดีฟส์'
+    'MM': 'พม่า'
   }
   return countries[countryCode] || countryCode
 }
